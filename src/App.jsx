@@ -19,10 +19,8 @@ const LB_PREFIX = "arena_lb:";
 const FIGHT_COST = 5;
 const MAX_HP = 100;
 const APP_VERSION = "0.5.0";
-const BOT_USERNAME = "YourVirtualDndBot"; // ← замени на @username своего бота при деплое
-// Эндпоинт твоего бэкенда, который создаёт ссылку на счёт в Telegram Stars (валюта XTR).
-// Пока пусто → магазин работает в демо-режиме. Заполнишь после деплоя сервера.
-const INVOICE_ENDPOINT = ""; // напр. "https://virtual-dnd.vercel.app/api/create-invoice"
+const BOT_USERNAME = import.meta.env?.VITE_BOT_USERNAME || "YourVirtualDndBot";
+const INVOICE_ENDPOINT = import.meta.env?.VITE_INVOICE_ENDPOINT || "";
 const STAR_PACKS = [10, 50, 100, 500];
 
 const CSS = `
@@ -56,23 +54,50 @@ textarea,input{font-family:'Manrope',sans-serif}
 .noanim *{animation:none!important;transition-duration:.01ms!important}
 `;
 
-/* ---------- storage (personal + shared) ---------- */
-const mem = {}, memShared = {};
+/* ---------- storage — личное в localStorage, общее через Supabase API ---------- */
+const mem = {};
+
+// Личное хранилище (профиль игрока) — localStorage
 async function sGet(key, def, shared = false) {
-  try { if (window.storage?.get) { const r = await window.storage.get(key, shared); return r?.value ? JSON.parse(r.value) : def; } } catch (e) {}
-  const m = shared ? memShared : mem; return key in m ? m[key] : def;
+  if (shared) return sGetShared(key, def);
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; } catch (e) { return def; }
 }
 async function sSet(key, val, shared = false) {
-  (shared ? memShared : mem)[key] = val;
-  try { if (window.storage?.set) await window.storage.set(key, JSON.stringify(val), shared); } catch (e) {}
+  if (shared) return sSetShared(key, val);
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
 }
 async function sDel(key, shared = false) {
-  delete (shared ? memShared : mem)[key];
-  try { if (window.storage?.delete) await window.storage.delete(key, shared); } catch (e) {}
+  if (shared) return sDelShared(key);
+  try { localStorage.removeItem(key); } catch (e) {}
 }
 async function sList(prefix, shared = false) {
-  try { if (window.storage?.list) { const r = await window.storage.list(prefix, shared); return r?.keys || []; } } catch (e) {}
-  return Object.keys(shared ? memShared : mem).filter((k) => k.startsWith(prefix));
+  if (shared) return sListShared(prefix);
+  return Object.keys(localStorage).filter((k) => k.startsWith(prefix));
+}
+
+// Общее хранилище — наш Vercel API → Supabase
+const API_BASE = "";  // пусто = относительный путь /api/...
+async function sGetShared(key, def) {
+  try {
+    const r = await fetch(`${API_BASE}/api/kv?key=${encodeURIComponent(key)}`);
+    if (!r.ok) return def;
+    const d = await r.json();
+    return d.value !== undefined ? d.value : def;
+  } catch (e) { return def; }
+}
+async function sSetShared(key, val) {
+  try { await fetch(`${API_BASE}/api/kv`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, value: val }) }); } catch (e) {}
+}
+async function sDelShared(key) {
+  try { await fetch(`${API_BASE}/api/kv?key=${encodeURIComponent(key)}`, { method: "DELETE" }); } catch (e) {}
+}
+async function sListShared(prefix) {
+  try {
+    const r = await fetch(`${API_BASE}/api/kv?prefix=${encodeURIComponent(prefix)}`);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d.keys || [];
+  } catch (e) { return []; }
 }
 
 /* ---------- telegram ---------- */
@@ -90,14 +115,16 @@ const tagOf = (u) => (u ? "@" + u : "без @username");
 function getStartParam() { try { return window.Telegram?.WebApp?.initDataUnsafe?.start_param || ""; } catch (e) { return ""; } }
 function haptic(kind, settings) { if (settings && !settings.haptics) return; try { window.Telegram?.WebApp?.HapticFeedback?.impactOccurred?.(kind || "light"); } catch (e) {} }
 
-/* ---------- AI ---------- */
+/* ---------- AI — через Vercel /api/ai → Gemini 2.0 Flash (бесплатно) ---------- */
 async function callClaude(system, user) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system, messages: [{ role: "user", content: user }] }),
+  const res = await fetch("/api/ai", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ system, user }),
   });
+  if (!res.ok) throw new Error("AI error " + res.status);
   const data = await res.json();
-  return (data.content || []).map((b) => b.text || "").join("\n").replace(/```json|```/g, "").trim();
+  return (data.text || "").replace(/```json|```/g, "").trim();
 }
 function safeJSON(t, fb) { try { return JSON.parse(t); } catch (e) { const m = t && t.match(/\{[\s\S]*\}/); if (m) { try { return JSON.parse(m[0]); } catch (_) {} } return fb; } }
 
@@ -178,6 +205,13 @@ export default function App() {
   async function publishProfile(p) {
     const card = { id: tg.id, name: tg.name, username: tg.username, photo: tg.photo, level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, timePlayedSec: p.timePlayedSec, bio: p.bio, rating: ratingOf(p), ts: Date.now() };
     await sSet(LB_PREFIX + tg.id, card, true);
+    // Также сохраняем в Supabase через API
+    try {
+      await fetch("/api/profile", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uid: String(tg.id), name: tg.name, username: tg.username, photo: tg.photo, level: p.level, xp: p.xp, wins: p.wins, losses: p.losses, time_played: p.timePlayedSec, bio: p.bio }),
+      });
+    } catch (e) {}
   }
   const publish = (over) => publishProfile({ ...profile, ...(over || {}) });
   const showToast = useCallback((t) => { setToast(t); setTimeout(() => setToast(""), 2200); }, []);
@@ -348,7 +382,7 @@ function Menu({ tg, profile, go, shareApp }) {
         </button>
       </div>
       <button className="tap rise" style={sx.hero} onClick={() => go("play")}>
-        <div style={{ position: "absolute", right: -10, bottom: -18, fontSize: 96, opacity: 0.18 }}>⚔️</div>
+        <div style={{ position: "absolute", right: -10, bottom: -18, fontSize: 96, opacity: 0.18, pointerEvents: "none", userSelect: "none" }}>⚔️</div>
         <Play size={26} fill="#1a1006" color="#1a1006" />
         <div style={{ textAlign: "left" }}><div className="display" style={{ fontSize: 24, color: "#1a1006" }}>ИГРАТЬ</div><div style={{ fontSize: 12.5, color: "#5a3a14", fontWeight: 600 }}>Дуэль с ИИ · случайный соперник · 2 игрока</div></div>
       </button>
