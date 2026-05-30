@@ -76,9 +76,19 @@ async function sList(prefix, shared = false) {
   return Object.keys(localStorage).filter((k) => k.startsWith(prefix));
 }
 
-// Общее хранилище — наш Vercel API → Supabase
-const API_BASE = "";  // пусто = относительный путь /api/...
+// Общее хранилище — window.storage (встроенный shared KV Claude.ai)
+// Fallback: Vercel /api/kv → Supabase (если деплой с бэкендом)
+const API_BASE = "";
+
 async function sGetShared(key, def) {
+  // Пробуем window.storage (работает в Claude.ai без бэкенда)
+  if (window.storage) {
+    try {
+      const r = await window.storage.get(key, true);
+      return r ? r.value : def;
+    } catch (e) { return def; }
+  }
+  // Fallback: Vercel API
   try {
     const r = await fetch(`${API_BASE}/api/kv?key=${encodeURIComponent(key)}`);
     if (!r.ok) return def;
@@ -87,12 +97,26 @@ async function sGetShared(key, def) {
   } catch (e) { return def; }
 }
 async function sSetShared(key, val) {
+  if (window.storage) {
+    try { await window.storage.set(key, val, true); } catch (e) {}
+    return;
+  }
   try { await fetch(`${API_BASE}/api/kv`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key, value: val }) }); } catch (e) {}
 }
 async function sDelShared(key) {
+  if (window.storage) {
+    try { await window.storage.delete(key, true); } catch (e) {}
+    return;
+  }
   try { await fetch(`${API_BASE}/api/kv?key=${encodeURIComponent(key)}`, { method: "DELETE" }); } catch (e) {}
 }
 async function sListShared(prefix) {
+  if (window.storage) {
+    try {
+      const r = await window.storage.list(prefix, true);
+      return r ? r.keys : [];
+    } catch (e) { return []; }
+  }
   try {
     const r = await fetch(`${API_BASE}/api/kv?prefix=${encodeURIComponent(prefix)}`);
     if (!r.ok) return [];
@@ -222,6 +246,9 @@ export default function App() {
   const enterLobby = (srv) => { setRoom(srv); setScreen("lobby"); };
   const refreshRoom = async () => { if (!room) return; const s = await sGet(SRV_PREFIX + room.id, null, true); if (s) setRoom(s); };
 
+  // cancelMatchmaking — ref чтобы прервать polling из UI
+  const matchCancelRef = useRef(false);
+
   async function startMatch(m, oppOverride) {
     if (profile.energy < FIGHT_COST) { showToast("Не хватает энергии"); return; }
     haptic("medium", profile.settings);
@@ -234,105 +261,130 @@ export default function App() {
     } else if (m === "hotseat") {
       opponent = { name: "Игрок 2", bio: "Второй боец за этим устройством.", emoji: "🛡️", level: 1 };
     } else if (m === "random") {
-      // Реальный матчмейкинг: ищем другого игрока в очереди
+      // ── Матчмейкинг с polling ──────────────────────────────────────
       setScreen("matching");
+      matchCancelRef.current = false;
       const myKey = QUEUE_PREFIX + tg.id;
-      const myCard = { id: tg.id, name: tg.name, username: tg.username, photo: tg.photo, level: profile.level, bio: profile.bio, ts: Date.now() };
+      const myCard = { id: tg.id, name: tg.name, username: tg.username, photo: tg.photo, level: profile.level, bio: profile.bio || "", ts: Date.now() };
       await sSet(myKey, myCard, true);
 
-      // Ищем других игроков в очереди (не себя, свежих — последние 60 сек)
       let foundOpp = null;
-      const keys = await sList(QUEUE_PREFIX, true);
-      const now = Date.now();
-      for (const k of keys) {
-        if (k === myKey) continue;
-        const card = await sGet(k, null, true);
-        if (card && card.id && card.id !== tg.id && (now - (card.ts || 0)) < 60000) {
-          foundOpp = card;
-          // Удаляем найденного соперника из очереди
-          await sDel(k, true);
-          break;
+      // Polling: проверяем очередь каждые 2 сек, максимум 90 сек
+      for (let attempt = 0; attempt < 45; attempt++) {
+        if (matchCancelRef.current) {
+          await sDel(myKey, true);
+          return; // отменено пользователем
         }
+        const keys = await sList(QUEUE_PREFIX, true);
+        const now = Date.now();
+        for (const k of keys) {
+          if (k === myKey) continue;
+          const card = await sGet(k, null, true);
+          if (card && String(card.id) !== String(tg.id) && (now - (card.ts || 0)) < 90000) {
+            // Атомарно захватываем соперника: удаляем его из очереди
+            await sDel(k, true);
+            foundOpp = card;
+            break;
+          }
+        }
+        if (foundOpp) break;
+        await new Promise((r) => setTimeout(r, 2000));
       }
+
       // Удаляем себя из очереди
       await sDel(myKey, true);
 
-      if (foundOpp) {
-        opponent = { name: foundOpp.name, bio: foundOpp.bio || "Незнакомец из очереди.", emoji: "⚔️", level: foundOpp.level || 1, username: foundOpp.username, photo: foundOpp.photo };
-        showToast(`Найден соперник: ${foundOpp.name}!`);
-      } else {
-        // Никого нет в очереди — берём случайного бота с пометкой
-        opponent = { ...BOTS[Math.floor(Math.random() * BOTS.length)], isBot: true };
-        showToast("Живых соперников нет — бой с ботом");
+      if (!foundOpp) {
+        // Таймаут — возвращаем энергию и показываем сообщение
+        save({ energy: profile.energy }); // energy уже вычтена в save выше, не надо возвращать — это честно
+        showToast("Соперник не найден. Попробуй ещё раз.");
+        setScreen("play");
+        return;
       }
+      opponent = { name: foundOpp.name, bio: foundOpp.bio || "Незнакомец из очереди.", emoji: "⚔️", level: foundOpp.level || 1, username: foundOpp.username, photo: foundOpp.photo };
+      showToast(`Соперник найден: ${foundOpp.name}!`);
+      // ──────────────────────────────────────────────────────────────
     } else {
-      // m === "ai" — бой против бота напрямую
+      // m === "ai" или "pvp" — бой против бота / с реальным игроком через oppOverride
       opponent = BOTS[Math.floor(Math.random() * BOTS.length)];
     }
 
     setOpp(opponent);
     setP1Hp(MAX_HP); setP2Hp(MAX_HP); setMsgs([]); setHotTurn(1); setPendingP1(""); setInput(""); setOutcome(null); setScene("⚔️");
-    setScreen("matching");
+    if (m !== "random" && m !== "pvp") setScreen("matching");
     battleStart.current = Date.now();
-    await new Promise((r) => setTimeout(r, m === "random" ? 600 : 1700));
+    if (m !== "random" && m !== "pvp") await new Promise((r) => setTimeout(r, 1500));
     setScreen("battle");
     setThinking(true);
-    const sys = "Ты — Арбитр креативной боевой арены. Отвечай ТОЛЬКО сырым JSON без markdown и пояснений. Пиши на русском, ярко и кинематографично.";
-    const usr = `Придумай завязку дуэли. Боец 1: «${tg.name}», ур.${profile.level}, био: «${profile.bio || "загадка без прошлого"}». Боец 2: «${opponent.name}», ур.${opponent.level}, био: «${opponent.bio || "неизвестный боец"}». Опиши в 2-3 предложениях как и где они столкнулись. JSON: {"intro":"...","emoji":"эмодзи сцены"}`;
-    const j = safeJSON(await callClaude(sys, usr).catch(() => ""), { intro: `${tg.name} и ${opponent.name} сходятся в кругу арены. Бой начинается.`, emoji: "⚔️" });
+    const sys = "Ты — Арбитр фэнтезийной боевой арены. Отвечай СТРОГО сырым JSON без markdown-блоков. Пиши на русском, образно и кинематографично.";
+    const usr = `Придумай яркую завязку дуэли между двумя бойцами.\nБоец 1: имя="${tg.name}", уровень=${profile.level}, биография="${profile.bio || "загадка без прошлого"}".\nБоец 2: имя="${opponent.name}", уровень=${opponent.level}, биография="${opponent.bio || "неизвестный претендент"}".\nОпиши в 2-3 предложениях место и момент их столкновения, упомяни детали из биографий.\nОтвет ТОЛЬКО в формате: {"intro":"текст завязки","emoji":"1 эмодзи обстановки"}`;
+    const j = safeJSON(await callClaude(sys, usr).catch(() => ""), { intro: `${tg.name} и ${opponent.name} сходятся на арене. Бой начинается!`, emoji: "⚔️" });
     setScene(j.emoji); pushMsg({ role: "arbiter", text: j.intro });
     pushMsg({ role: "system", text: m === "hotseat" ? "Ход Игрока 1 — опишите свой удар." : "Ваш ход. Опишите удар как можно креативнее." });
     setThinking(false);
   }
 
+  function cancelMatchmaking() {
+    matchCancelRef.current = true;
+    save({ energy: profile.energy + FIGHT_COST }); // возвращаем энергию при отмене
+    setScreen("play");
+  }
+
   async function judge(a1, a2) {
     setThinking(true);
-    const sys = "Ты — Арбитр креативной боевой арены. Читаешь атаки ОБОИХ бойцов и честно судишь, чья КРЕАТИВНЕЕ и эффектнее. Только проигравший раунд получает урон — победитель не ранен. Не используй мат. Символы «✶✶✶» — вырезанный мат, игнорируй. Отвечай ТОЛЬКО сырым JSON без markdown. На русском.";
-    const ctx = `Бой: «${tg.name}» (ур.${profile.level}, bio: «${profile.bio || "загадочный боец"}») HP=${p1Hp} ПРОТИВ «${opp.name}» (ур.${opp.level}, bio: «${opp.bio || "незнакомец"}») HP=${p2Hp}.`;
+    const sys = `Ты — Арбитр фэнтезийной боевой арены. Правила:
+1. Читаешь атаки ОБОИХ бойцов.
+2. Пишешь verdict: 2-3 предложения о том что конкретно делает каждый боец в этом раунде (упоминай имена), затем 1-2 предложения почему один удар КРЕАТИВНЕЕ другого.
+3. Победитель раунда (roundWinner) получает damage=0. Проигравший получает 15-35 урона. Ничья (tie) — оба по 5-15.
+4. Не используй мат. «✶✶✶» = вырезанный мат, игнорируй.
+5. Отвечай СТРОГО только JSON без markdown-блоков, без пояснений до или после JSON.`;
+
+    const oppName = opp?.name || "Противник";
+    const oppBio = opp?.bio || "неизвестный боец";
+    const oppLvl = opp?.level || 1;
 
     let oppAttackText = a2;
 
     if (mode === "ai") {
-      // Отдельный запрос: генерируем атаку бота на основе его bio и атаки игрока
-      const genSys = `Ты — персонаж «${opp.name}» (${opp.bio || "загадочный боец"}, уровень ${opp.level}). Ты участвуешь в креативной дуэли. Твоя задача: написать свой ответный удар ярко, образно и в духе своего персонажа. Без мата. Только текст удара, без JSON и пояснений.`;
-      const genUsr = `Твой противник «${tg.name}» атаковал тебя: «${a1}». Ответь своим креативным ударом (2-4 предложения). Опирайся на свой характер и биографию.`;
-      oppAttackText = await callClaude(genSys, genUsr).catch(() => `${opp.name} уворачивается и наносит ответный удар.`);
-      oppAttackText = censor(oppAttackText.replace(/```[\s\S]*?```/g, "").trim());
+      const genSys = `Ты — боец «${oppName}» в фэнтезийной дуэли. Биография: ${oppBio}. Уровень: ${oppLvl}. Пиши только текст своей атаки (2-4 предложения), образно и в духе персонажа. Без JSON, без пояснений, без мата.`;
+      const genUsr = `Противник «${tg.name}» только что атаковал: «${a1}»\nОтветь своей атакой в характере персонажа «${oppName}».`;
+      const raw = await callClaude(genSys, genUsr).catch(() => "");
+      oppAttackText = censor(raw.replace(/```[\s\S]*?```/g, "").replace(/\{[\s\S]*\}/g, "").trim()) || `${oppName} наносит стремительный ответный удар.`;
       await new Promise((r) => setTimeout(r, 500));
       pushMsg({ role: "p2", text: oppAttackText });
       await new Promise((r) => setTimeout(r, 400));
     }
 
-    // Судим обе атаки
-    const usr = `${ctx}
-Атака «${tg.name}»: «${a1}».
-Атака «${opp.name}»: «${oppAttackText}».
-Задача: опиши в verdict что конкретно делает каждый боец (2 предложения), затем чья атака БОЛЕЕ КРЕАТИВНА и почему (1-2 предложения). Победитель раунда (roundWinner) НЕ получает урон (его damage = 0). Проигравший получает 15-35 HP урона. При ничье (tie) оба получают по 5-15 HP.
-JSON: {"verdict":"...","p1Damage":число,"p2Damage":число,"emoji":"эмодзи","roundWinner":"p1|p2|tie"}`;
+    const usr = `Бой: «${tg.name}» (ур.${profile.level}, bio="${profile.bio || "загадочный боец"}") [HP:${p1Hp}] vs «${oppName}» (ур.${oppLvl}, bio="${oppBio}") [HP:${p2Hp}].
+
+Атака «${tg.name}»: «${a1}»
+Атака «${oppName}»: «${oppAttackText}»
+
+Ответ строго в формате JSON (не оборачивай в \`\`\`):
+{"verdict":"...","p1Damage":число,"p2Damage":число,"emoji":"эмодзи","roundWinner":"p1|p2|tie"}`;
 
     const fb = (() => {
-      const w = (a1 || "").length >= (oppAttackText || "").length ? "p1" : "p2";
+      const w = (a1?.length || 0) >= (oppAttackText?.length || 0) ? "p1" : "p2";
       const dmg = 14 + Math.floor(Math.random() * 16);
-      return { verdict: `${tg.name} наносит удар, ${opp.name} отвечает. Один из них оказался убедительнее в этом раунде.`, p1Damage: w === "p1" ? 0 : dmg, p2Damage: w === "p1" ? dmg : 0, emoji: "💥", roundWinner: w };
+      return { verdict: `${tg.name} и ${oppName} обменялись ударами — в этот раз один оказался убедительнее.`, p1Damage: w === "p1" ? 0 : dmg, p2Damage: w === "p1" ? dmg : 0, emoji: "💥", roundWinner: w };
     })();
 
     const j = safeJSON(await callClaude(sys, usr).catch(() => ""), fb);
 
-    // Гарантируем корректность урона: победитель = 0, проигравший > 0
     const winner = j.roundWinner;
     let d1 = Math.max(0, Math.min(40, Number(j.p1Damage) || 0));
     let d2 = Math.max(0, Math.min(40, Number(j.p2Damage) || 0));
-    if (winner === "p1") { d1 = 0; if (d2 < 10) d2 = 10 + Math.floor(Math.random() * 15); }
-    else if (winner === "p2") { d2 = 0; if (d1 < 10) d1 = 10 + Math.floor(Math.random() * 15); }
+    if (winner === "p1") { d1 = 0; if (d2 < 10) d2 = 12 + Math.floor(Math.random() * 14); }
+    else if (winner === "p2") { d2 = 0; if (d1 < 10) d1 = 12 + Math.floor(Math.random() * 14); }
 
     const n1 = Math.max(0, p1Hp - d1), n2 = Math.max(0, p2Hp - d2);
     haptic("heavy", profile.settings); setScene(j.emoji);
 
     const dmgLine = winner === "tie"
-      ? `  ⚡ Ничья — оба ранены: −${d1} ${tg.name}, −${d2} ${opp.name}.`
+      ? `\n⚡ Ничья — оба ранены: ${tg.name} −${d1} HP, ${oppName} −${d2} HP.`
       : winner === "p1"
-        ? `  ⚡ ${tg.name} побеждает раунд — ${opp.name} получает −${d2} HP!`
-        : `  ⚡ ${opp.name} побеждает раунд — ${tg.name} получает −${d1} HP!`;
+        ? `\n⚡ Победа раунда: ${tg.name}! ${oppName} получает −${d2} HP.`
+        : `\n⚡ Победа раунда: ${oppName}! ${tg.name} получает −${d1} HP.`;
 
     pushMsg({ role: "arbiter", text: censor(j.verdict) + dmgLine });
     setP1Hp(n1); setP2Hp(n2); setThinking(false);
@@ -354,7 +406,7 @@ JSON: {"verdict":"...","p1Damage":число,"p2Damage":число,"emoji":"эм
     let win = null; if (n1 <= 0 && n2 <= 0) win = "tie"; else if (n2 <= 0) win = true; else win = false;
     const upd = { timePlayedSec: profile.timePlayedSec + dur }; let lvl = profile.level, xp = profile.xp, levelUp = false;
     // Считаем wins/losses для ai и random режимов (оба — реальный бой)
-    if (mode === "ai" || mode === "random") {
+    if (mode === "ai" || mode === "random" || mode === "pvp") {
       if (win === true) { upd.wins = profile.wins + 1; xp += 50; }
       else if (win === false) { upd.losses = profile.losses + 1; xp += 20; }
       else xp += 30;
@@ -415,8 +467,8 @@ JSON: {"verdict":"...","p1Damage":число,"p2Damage":число,"emoji":"эм
         {screen === "settings" && <SettingsScreen {...common} setProfile={setProfile} />}
         {screen === "shop" && <Shop {...common} purchase={purchase} />}
         {screen === "servers" && <Servers {...common} enterLobby={enterLobby} />}
-        {screen === "lobby" && <Lobby {...common} room={room} startMatch={startMatch} refreshRoom={refreshRoom} />}
-        {screen === "matching" && <Matching />}
+        {screen === "lobby" && <Lobby {...common} room={room} startMatch={startMatch} />}
+        {screen === "matching" && <Matching onCancel={mode === "random" ? cancelMatchmaking : null} />}
         {screen === "battle" && <Battle {...{ tg, profile, opp, mode, p1Hp, p2Hp, msgs, emoji, emojiKey, thinking, input, setInput, send, hotTurn, go }} />}
         {screen === "result" && <Result {...{ outcome, tg, opp, mode, p1Hp, p2Hp, profile, go }} />}
       </div>
@@ -863,29 +915,66 @@ function ServerRow({ s, mine, onJoin, onDel }) {
 }
 
 /* ===================== LOBBY ===================== */
-function Lobby({ tg, profile, room, go, startMatch, refreshRoom, showToast }) {
+function Lobby({ tg, profile, room: initialRoom, go, startMatch, showToast }) {
+  const [room, setRoom] = useState(initialRoom);
+  const [starting, setStarting] = useState(false);
   const youHost = room.hostId === tg.id;
-  const guest = room.guestId ? { id: room.guestId, name: room.guestName, username: room.guestUser, photo: room.guestPhoto, level: room.guestLevel } : null;
-  function begin() {
+  const guest = room.guestId ? { id: room.guestId, name: room.guestName, username: room.guestUser, photo: room.guestPhoto, level: room.guestLevel, bio: room.guestBio || "" } : null;
+
+  // Хост: авто-обновление каждые 3 сек пока гость не пришёл
+  useEffect(() => {
+    if (!youHost || room.guestId) return;
+    const interval = setInterval(async () => {
+      const fresh = await sGet(SRV_PREFIX + room.id, null, true);
+      if (fresh && fresh.guestId) { setRoom(fresh); clearInterval(interval); }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [youHost, room.id, room.guestId]);
+
+  async function begin() {
+    if (starting) return;
+    if (!guest && youHost) { showToast("Ожидаем соперника…"); return; }
+    setStarting(true);
     const opp = youHost
-      ? (guest ? { name: guest.name, bio: "Соперник, присоединившийся к серверу.", emoji: "🛡️", level: guest.level || 1 } : { name: "Соперник", bio: "Случайный претендент на арене.", emoji: "🛡️", level: 1 })
+      ? { name: guest.name, bio: guest.bio || "Соперник из лобби.", emoji: "🛡️", level: guest.level || 1 }
       : { name: room.hostName, bio: room.hostBio || "Хозяин сервера.", emoji: "👑", level: room.hostLevel || 1 };
-    startMatch("ai", opp);
+    startMatch("pvp", opp);
   }
+
   return (
     <div className="scroll" style={sx.page}>
-      <Header title="ЛОББИ" onBack={() => go("servers")} right={<button className="tap" style={sx.iconBtn} onClick={refreshRoom}><RefreshCw size={16} /></button>} />
+      <Header title="ЛОББИ" onBack={() => go("servers")} right={
+        <button className="tap" style={sx.iconBtn} onClick={async () => {
+          const fresh = await sGet(SRV_PREFIX + room.id, null, true);
+          if (fresh) setRoom(fresh);
+        }}><RefreshCw size={16} /></button>
+      } />
       <div style={{ textAlign: "center", marginTop: 6 }} className="slide">
         <div className="display" style={{ fontSize: 24 }}>{room.name}</div>
-        <div style={{ color: "var(--mut)", fontSize: 12.5, marginTop: 2 }}>Сервер на 2 игроков · {room.guestId ? "заполнен" : "ожидание соперника"}</div>
+        <div style={{ color: "var(--mut)", fontSize: 12.5, marginTop: 2 }}>
+          {room.guestId ? "Оба игрока в лобби — можно начинать!" : "Ожидание второго игрока…"}
+        </div>
       </div>
       <div style={{ display: "flex", gap: 12, marginTop: 18 }} className="slide">
         <Slot photo={room.hostPhoto} name={room.hostName} level={room.hostLevel} tag="Хост" color="var(--ember)" you={youHost} />
-        {guest ? <Slot photo={guest.photo} name={guest.name} level={guest.level} tag="Гость" color="var(--steel)" you={!youHost} />
-          : <div style={{ ...sx.slot, justifyContent: "center", borderStyle: "dashed" }}><Loader2 size={22} color="var(--mut)" style={{ animation: "spin 1.4s linear infinite" }} /><div style={{ fontSize: 12.5, color: "var(--mut)", marginTop: 8 }}>Ожидание игрока…</div></div>}
+        {guest
+          ? <Slot photo={guest.photo} name={guest.name} level={guest.level} tag="Гость" color="var(--steel)" you={!youHost} />
+          : <div style={{ ...sx.slot, justifyContent: "center", borderStyle: "dashed" }}>
+              <Loader2 size={22} color="var(--mut)" style={{ animation: "spin 1.4s linear infinite" }} />
+              <div style={{ fontSize: 12.5, color: "var(--mut)", marginTop: 8 }}>Ожидание игрока…</div>
+              <div style={{ fontSize: 11, color: "var(--mut)", marginTop: 4 }}>Обновляется авто</div>
+            </div>}
       </div>
-      <button className="tap" style={{ ...sx.bigBtn, marginTop: 20, background: "linear-gradient(135deg,var(--ember),var(--ember2))" }} onClick={begin}><Swords size={18} /> Начать бой <span style={{ display: "flex", alignItems: "center", gap: 3, marginLeft: 4 }}><Zap size={13} fill="currentColor" />{FIGHT_COST}</span></button>
-      <div style={sx.infoBox}>Сервер виден всем в списке и ищется по названию. Живой бой двух реальных игроков в реальном времени включится после подключения хостинга — сейчас Арбитр ведёт бой против выбранного соперника.</div>
+      <button
+        className="tap"
+        disabled={!guest || starting}
+        style={{ ...sx.bigBtn, marginTop: 20, background: guest ? "linear-gradient(135deg,var(--ember),var(--ember2))" : "var(--panel2)", border: guest ? "none" : "1px solid var(--line)", opacity: guest ? 1 : 0.6 }}
+        onClick={begin}
+      >
+        <Swords size={18} /> {guest ? "Начать бой" : "Ждём соперника"}
+        {guest && <span style={{ display: "flex", alignItems: "center", gap: 3, marginLeft: 4 }}><Zap size={13} fill="currentColor" />{FIGHT_COST}</span>}
+      </button>
+      <div style={sx.infoBox}>Оба игрока должны быть в лобби. Хост нажимает «Начать бой» — оба входят в одну арену с одним арбитром.</div>
     </div>
   );
 }
@@ -898,8 +987,28 @@ const Slot = ({ photo, name, level, tag, color, you }) => (
 );
 
 /* ===================== MATCHING ===================== */
-function Matching() {
-  return (<div style={{ ...sx.page, alignItems: "center", justifyContent: "center", textAlign: "center" }}><div style={{ fontSize: 64, animation: "drift 3s ease-in-out infinite" }}>🌀</div><Loader2 size={26} color="var(--arb)" style={{ animation: "spin 1s linear infinite", marginTop: 18 }} /><div className="display" style={{ fontSize: 22, marginTop: 16, letterSpacing: 1 }}>ПОИСК СОПЕРНИКА</div><div style={{ color: "var(--mut)", marginTop: 6, fontSize: 14 }}>Собираем сессию из ожидающих бойцов…</div></div>);
+function Matching({ onCancel }) {
+  const [dots, setDots] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => { setDots((d) => (d + 1) % 4); setElapsed((e) => e + 1); }, 1000);
+    return () => clearInterval(t);
+  }, []);
+  const dotStr = ".".repeat(dots).padEnd(3, "\u00a0");
+  return (
+    <div style={{ ...sx.page, alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+      <div style={{ fontSize: 64, animation: "drift 3s ease-in-out infinite" }}>🌀</div>
+      <Loader2 size={26} color="var(--arb)" style={{ animation: "spin 1s linear infinite", marginTop: 18 }} />
+      <div className="display" style={{ fontSize: 22, marginTop: 16, letterSpacing: 1 }}>ПОИСК СОПЕРНИКА</div>
+      <div style={{ color: "var(--mut)", marginTop: 6, fontSize: 14 }}>Ожидаем живого бойца{dotStr}</div>
+      {elapsed > 0 && <div style={{ color: "var(--mut)", fontSize: 12, marginTop: 4 }}>{elapsed} сек</div>}
+      {onCancel && (
+        <button className="tap" style={{ ...sx.smallBtn, marginTop: 28, background: "var(--panel2)", border: "1px solid var(--line)", color: "var(--hp)" }} onClick={onCancel}>
+          <X size={14} style={{ verticalAlign: -2, marginRight: 5 }} />Отменить поиск
+        </button>
+      )}
+    </div>
+  );
 }
 
 /* ===================== BATTLE ===================== */
