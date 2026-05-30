@@ -16,6 +16,7 @@ const STORE_KEY = "tg_arena_profile_v3";
 const SRV_PREFIX = "arena_srv:";
 const REF_PREFIX = "arena_refs:";
 const LB_PREFIX = "arena_lb:";
+const QUEUE_PREFIX = "arena_queue:";
 const FIGHT_COST = 5;
 const MAX_HP = 100;
 const APP_VERSION = "0.5.0";
@@ -226,19 +227,58 @@ export default function App() {
     haptic("medium", profile.settings);
     save({ energy: profile.energy - FIGHT_COST });
     setMode(m);
-    const opponent = oppOverride
-      ? oppOverride
-      : m === "hotseat"
-        ? { name: "Игрок 2", bio: "Второй боец за этим устройством.", emoji: "🛡️", level: 1 }
-        : BOTS[Math.floor(Math.random() * BOTS.length)];
+
+    let opponent;
+    if (oppOverride) {
+      opponent = oppOverride;
+    } else if (m === "hotseat") {
+      opponent = { name: "Игрок 2", bio: "Второй боец за этим устройством.", emoji: "🛡️", level: 1 };
+    } else if (m === "random") {
+      // Реальный матчмейкинг: ищем другого игрока в очереди
+      setScreen("matching");
+      const myKey = QUEUE_PREFIX + tg.id;
+      const myCard = { id: tg.id, name: tg.name, username: tg.username, photo: tg.photo, level: profile.level, bio: profile.bio, ts: Date.now() };
+      await sSet(myKey, myCard, true);
+
+      // Ищем других игроков в очереди (не себя, свежих — последние 60 сек)
+      let foundOpp = null;
+      const keys = await sList(QUEUE_PREFIX, true);
+      const now = Date.now();
+      for (const k of keys) {
+        if (k === myKey) continue;
+        const card = await sGet(k, null, true);
+        if (card && card.id && card.id !== tg.id && (now - (card.ts || 0)) < 60000) {
+          foundOpp = card;
+          // Удаляем найденного соперника из очереди
+          await sDel(k, true);
+          break;
+        }
+      }
+      // Удаляем себя из очереди
+      await sDel(myKey, true);
+
+      if (foundOpp) {
+        opponent = { name: foundOpp.name, bio: foundOpp.bio || "Незнакомец из очереди.", emoji: "⚔️", level: foundOpp.level || 1, username: foundOpp.username, photo: foundOpp.photo };
+        showToast(`Найден соперник: ${foundOpp.name}!`);
+      } else {
+        // Никого нет в очереди — берём случайного бота с пометкой
+        opponent = { ...BOTS[Math.floor(Math.random() * BOTS.length)], isBot: true };
+        showToast("Живых соперников нет — бой с ботом");
+      }
+    } else {
+      // m === "ai" — бой против бота напрямую
+      opponent = BOTS[Math.floor(Math.random() * BOTS.length)];
+    }
+
     setOpp(opponent);
     setP1Hp(MAX_HP); setP2Hp(MAX_HP); setMsgs([]); setHotTurn(1); setPendingP1(""); setInput(""); setOutcome(null); setScene("⚔️");
-    setScreen(m === "ai" ? "matching" : "battle");
+    setScreen("matching");
     battleStart.current = Date.now();
-    if (m === "ai") { await new Promise((r) => setTimeout(r, 1700)); setScreen("battle"); }
+    await new Promise((r) => setTimeout(r, m === "random" ? 600 : 1700));
+    setScreen("battle");
     setThinking(true);
     const sys = "Ты — Арбитр креативной боевой арены. Отвечай ТОЛЬКО сырым JSON без markdown и пояснений. Пиши на русском, ярко и кинематографично.";
-    const usr = `Придумай завязку дуэли. Боец 1: «${tg.name}», ур.${profile.level}, био: «${profile.bio || "загадка без прошлого"}». Боец 2: «${opponent.name}», ур.${opponent.level}, био: «${opponent.bio}». Опиши в 2-3 предложениях как и где они столкнулись. JSON: {"intro":"...","emoji":"эмодзи сцены"}`;
+    const usr = `Придумай завязку дуэли. Боец 1: «${tg.name}», ур.${profile.level}, био: «${profile.bio || "загадка без прошлого"}». Боец 2: «${opponent.name}», ур.${opponent.level}, био: «${opponent.bio || "неизвестный боец"}». Опиши в 2-3 предложениях как и где они столкнулись. JSON: {"intro":"...","emoji":"эмодзи сцены"}`;
     const j = safeJSON(await callClaude(sys, usr).catch(() => ""), { intro: `${tg.name} и ${opponent.name} сходятся в кругу арены. Бой начинается.`, emoji: "⚔️" });
     setScene(j.emoji); pushMsg({ role: "arbiter", text: j.intro });
     pushMsg({ role: "system", text: m === "hotseat" ? "Ход Игрока 1 — опишите свой удар." : "Ваш ход. Опишите удар как можно креативнее." });
@@ -247,18 +287,54 @@ export default function App() {
 
   async function judge(a1, a2) {
     setThinking(true);
-    const sys = "Ты — Арбитр креативной боевой арены, судишь честно и с юмором, оцениваешь чей удар КРЕАТИВНЕЕ. Не используй нецензурную лексику. Символы «✶✶✶» означают вырезанный мат — игнорируй их и не воспроизводи. Отвечай ТОЛЬКО сырым JSON без markdown. На русском.";
-    const ctx = `Контекст: «${tg.name}» (ур.${profile.level}) против «${opp.name}» (ур.${opp.level}). HP: ${tg.name}=${p1Hp}, ${opp.name}=${p2Hp}.`;
-    const usr = mode === "ai"
-      ? `${ctx}\nРеплика "${tg.name}": «${a1}».\nСначала придумай ответный креативный удар за "${opp.name}" (без мата). Прочитай реплики обоих и в поле verdict дай короткое описание состязания — что именно делают оба бойца в этом раунде, — затем кто креативнее и почему. Назначь урон (0-35). JSON: {"opponentAttack":"...","verdict":"короткое описание состязания + вердикт, 2-4 предложения","p1Damage":n,"p2Damage":n,"emoji":"эмодзи момента","roundWinner":"p1|p2|tie"}`
-      : `${ctx}\nРеплика "${tg.name}": «${a1}».\nРеплика "${opp.name}": «${a2}».\nПрочитай реплики обоих и в поле verdict дай короткое описание состязания — что именно делают оба бойца, — затем кто креативнее и почему. Назначь урон (0-35). JSON: {"verdict":"короткое описание состязания + вердикт, 2-4 предложения","p1Damage":n,"p2Damage":n,"emoji":"эмодзи момента","roundWinner":"p1|p2|tie"}`;
-    const fb = (() => { const w = (a1 || "").length >= (a2 || "").length ? "p1" : "p2"; const lo = 14 + Math.floor(Math.random() * 16), hi = 4 + Math.floor(Math.random() * 8); return { opponentAttack: `${opp.name} отвечает резким манёвром.`, verdict: "Оба бойца сходятся в стремительной сшибке — один удар лёг точнее.", p1Damage: w === "p1" ? hi : lo, p2Damage: w === "p1" ? lo : hi, emoji: "💥", roundWinner: w }; })();
+    const sys = "Ты — Арбитр креативной боевой арены. Читаешь атаки ОБОИХ бойцов и честно судишь, чья КРЕАТИВНЕЕ и эффектнее. Только проигравший раунд получает урон — победитель не ранен. Не используй мат. Символы «✶✶✶» — вырезанный мат, игнорируй. Отвечай ТОЛЬКО сырым JSON без markdown. На русском.";
+    const ctx = `Бой: «${tg.name}» (ур.${profile.level}, bio: «${profile.bio || "загадочный боец"}») HP=${p1Hp} ПРОТИВ «${opp.name}» (ур.${opp.level}, bio: «${opp.bio || "незнакомец"}») HP=${p2Hp}.`;
+
+    let oppAttackText = a2;
+
+    if (mode === "ai") {
+      // Отдельный запрос: генерируем атаку бота на основе его bio и атаки игрока
+      const genSys = `Ты — персонаж «${opp.name}» (${opp.bio || "загадочный боец"}, уровень ${opp.level}). Ты участвуешь в креативной дуэли. Твоя задача: написать свой ответный удар ярко, образно и в духе своего персонажа. Без мата. Только текст удара, без JSON и пояснений.`;
+      const genUsr = `Твой противник «${tg.name}» атаковал тебя: «${a1}». Ответь своим креативным ударом (2-4 предложения). Опирайся на свой характер и биографию.`;
+      oppAttackText = await callClaude(genSys, genUsr).catch(() => `${opp.name} уворачивается и наносит ответный удар.`);
+      oppAttackText = censor(oppAttackText.replace(/```[\s\S]*?```/g, "").trim());
+      await new Promise((r) => setTimeout(r, 500));
+      pushMsg({ role: "p2", text: oppAttackText });
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    // Судим обе атаки
+    const usr = `${ctx}
+Атака «${tg.name}»: «${a1}».
+Атака «${opp.name}»: «${oppAttackText}».
+Задача: опиши в verdict что конкретно делает каждый боец (2 предложения), затем чья атака БОЛЕЕ КРЕАТИВНА и почему (1-2 предложения). Победитель раунда (roundWinner) НЕ получает урон (его damage = 0). Проигравший получает 15-35 HP урона. При ничье (tie) оба получают по 5-15 HP.
+JSON: {"verdict":"...","p1Damage":число,"p2Damage":число,"emoji":"эмодзи","roundWinner":"p1|p2|tie"}`;
+
+    const fb = (() => {
+      const w = (a1 || "").length >= (oppAttackText || "").length ? "p1" : "p2";
+      const dmg = 14 + Math.floor(Math.random() * 16);
+      return { verdict: `${tg.name} наносит удар, ${opp.name} отвечает. Один из них оказался убедительнее в этом раунде.`, p1Damage: w === "p1" ? 0 : dmg, p2Damage: w === "p1" ? dmg : 0, emoji: "💥", roundWinner: w };
+    })();
+
     const j = safeJSON(await callClaude(sys, usr).catch(() => ""), fb);
-    if (mode === "ai" && j.opponentAttack) { await new Promise((r) => setTimeout(r, 650)); pushMsg({ role: "p2", text: censor(j.opponentAttack) }); await new Promise((r) => setTimeout(r, 450)); }
-    const d1 = Math.max(0, Math.min(40, Number(j.p1Damage) || 0)), d2 = Math.max(0, Math.min(40, Number(j.p2Damage) || 0));
+
+    // Гарантируем корректность урона: победитель = 0, проигравший > 0
+    const winner = j.roundWinner;
+    let d1 = Math.max(0, Math.min(40, Number(j.p1Damage) || 0));
+    let d2 = Math.max(0, Math.min(40, Number(j.p2Damage) || 0));
+    if (winner === "p1") { d1 = 0; if (d2 < 10) d2 = 10 + Math.floor(Math.random() * 15); }
+    else if (winner === "p2") { d2 = 0; if (d1 < 10) d1 = 10 + Math.floor(Math.random() * 15); }
+
     const n1 = Math.max(0, p1Hp - d1), n2 = Math.max(0, p2Hp - d2);
     haptic("heavy", profile.settings); setScene(j.emoji);
-    pushMsg({ role: "arbiter", text: censor(j.verdict) + (d1 || d2 ? `  ⚡ −${d2} ${opp.name}, −${d1} ${tg.name}.` : "") });
+
+    const dmgLine = winner === "tie"
+      ? `  ⚡ Ничья — оба ранены: −${d1} ${tg.name}, −${d2} ${opp.name}.`
+      : winner === "p1"
+        ? `  ⚡ ${tg.name} побеждает раунд — ${opp.name} получает −${d2} HP!`
+        : `  ⚡ ${opp.name} побеждает раунд — ${tg.name} получает −${d1} HP!`;
+
+    pushMsg({ role: "arbiter", text: censor(j.verdict) + dmgLine });
     setP1Hp(n1); setP2Hp(n2); setThinking(false);
     if (n1 <= 0 || n2 <= 0) { endBattle(n1, n2); return; }
     if (mode === "hotseat") { setHotTurn(1); pushMsg({ role: "system", text: "Ход Игрока 1 — опишите свой удар." }); }
@@ -277,8 +353,14 @@ export default function App() {
     const dur = Math.floor((Date.now() - battleStart.current) / 1000);
     let win = null; if (n1 <= 0 && n2 <= 0) win = "tie"; else if (n2 <= 0) win = true; else win = false;
     const upd = { timePlayedSec: profile.timePlayedSec + dur }; let lvl = profile.level, xp = profile.xp, levelUp = false;
-    if (mode === "ai") { if (win === true) { upd.wins = profile.wins + 1; xp += 50; } else if (win === false) { upd.losses = profile.losses + 1; xp += 20; } else xp += 30; }
-    else xp += 25;
+    // Считаем wins/losses для ai и random режимов (оба — реальный бой)
+    if (mode === "ai" || mode === "random") {
+      if (win === true) { upd.wins = profile.wins + 1; xp += 50; }
+      else if (win === false) { upd.losses = profile.losses + 1; xp += 20; }
+      else xp += 30;
+    } else {
+      xp += 25; // hotseat
+    }
     while (xp >= xpForNext(lvl)) { xp -= xpForNext(lvl); lvl++; levelUp = true; }
     upd.level = lvl; upd.xp = xp; save(upd);
     publishProfile({ ...profile, ...upd });
@@ -407,7 +489,7 @@ function PlayScreen({ profile, go, startMatch }) {
     <div className="scroll" style={sx.page}>
       <Header title="ИГРАТЬ" onBack={() => go("menu")} />
       <div style={{ display: "flex", flexDirection: "column", gap: 11, marginTop: 8 }} className="slide">
-        <ModeBtn color="linear-gradient(135deg,var(--ember),var(--ember2))" icon={<Dices size={20} />} title="Случайный соперник" sub="Матчмейкинг из ожидающих" disabled={low} onClick={() => startMatch("ai")} />
+        <ModeBtn color="linear-gradient(135deg,var(--ember),var(--ember2))" icon={<Dices size={20} />} title="Случайный соперник" sub="Матчмейкинг из ожидающих" disabled={low} onClick={() => startMatch("random")} />
         <ModeBtn color="linear-gradient(135deg,var(--steel2),var(--steel))" icon={<Bot size={20} />} title="Бой против ИИ" sub="Соперник под управлением Арбитра" disabled={low} onClick={() => startMatch("ai")} />
         <ModeBtn color="var(--panel2)" border icon={<Users size={20} />} title="Горячий стул" sub="Двое за одним устройством" disabled={low} onClick={() => startMatch("hotseat")} />
       </div>
@@ -430,6 +512,31 @@ function Leaderboard({ tg, go }) {
   const [view, setView] = useState(null);
   const load = useCallback(async () => {
     setPlayers(null);
+    try {
+      // Используем быстрый /api/leaderboard (прямой запрос к Supabase)
+      const r = await fetch("/api/leaderboard?limit=50");
+      if (r.ok) {
+        const data = await r.json();
+        if (Array.isArray(data) && data.length > 0) {
+          const arr = data.map((p) => ({
+            id: p.tg_id,
+            name: p.name,
+            username: p.username,
+            photo: p.photo,
+            level: p.level,
+            xp: p.xp,
+            wins: p.wins,
+            losses: p.losses,
+            bio: p.bio,
+            rating: p.rating || Math.max(0, (p.level || 1) * 100 + (p.wins || 0) * 20 - (p.losses || 0) * 5),
+            timePlayedSec: p.time_played || 0,
+          }));
+          setPlayers(arr);
+          return;
+        }
+      }
+    } catch (e) {}
+    // Fallback: KV-хранилище (если /api/leaderboard недоступен)
     const keys = await sList(LB_PREFIX, true);
     const arr = [];
     for (const k of keys) { const c = await sGet(k, null, true); if (c && c.id) arr.push(c); }
